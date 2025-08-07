@@ -1,5 +1,4 @@
 import pandas as pd
-import pickle
 
 def count_flips(row):
     # Drop NaNs, convert to 0/1 based on threshold
@@ -8,10 +7,13 @@ def count_flips(row):
     return (rounded.diff().fillna(0) != 0).sum()
 
 
-for task in ['icu']:
-    df = pd.read_csv(f'{task}.csv')
+for method in ['median']: # 
+    for task in ['hypoglycemia']:
+        for model_name in ['xgb', 'rf']:
+            i = 0
+            df = pd.read_csv(f'results/{model_name}_{task}_{method}_{i}_smooth.csv')
 
-    # Apply to each row
-    df['flip_count'] = df.apply(count_flips, axis=1)
-    print(task)
-    print(df['flip_count'].mean())
+            # Apply to each row
+            df['flip_count'] = df.apply(count_flips, axis=1)
+
+            print(df['flip_count'].mean())
