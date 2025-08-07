@@ -22,10 +22,6 @@ class CustomGPT(nn.Module):
         self.combine_layer = nn.Linear(hidden_size*2, hidden_size)
 
     def forward(self, input_ids, times, attention_mask=None):
-        assert(input_ids.max().item() < self.vocab_size)  
-        assert(input_ids.min() >= 0)
-
-        assert(self.model.base_model.wte.num_embeddings == self.vocab_size)
         token_embeddings = self.model.base_model.wte(input_ids)
         time_embeddings = self.time_layer(times.unsqueeze(-1))
         embs = token_embeddings + time_embeddings
@@ -50,7 +46,8 @@ class CustomMamba(nn.Module):
         super().__init__()
         print(n_layers)
         
-        self.backbone = AutoModelForCausalLM.from_pretrained("StanfordShahLab/mamba-tiny-16384-clmbr")
+        # self.backbone = AutoModelForCausalLM.from_pretrained("StanfordShahLab/mamba-tiny-16384-clmbr")
+        self.backbone = AutoModelForCausalLM.from_pretrained("state-spaces/mamba-130m-hf")
         self.backbone.resize_token_embeddings(vocab_size)
 
         if not n_layers is None:

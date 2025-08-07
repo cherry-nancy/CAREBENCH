@@ -116,7 +116,7 @@ def create_df():
     df = df.sort_values(['CSN', 'time']).groupby('CSN').agg(list).reset_index(drop=True)
     return df
 
-def sepsis_loader(batch_size, context_length = 1024, seed=1234):
+def mcmed_loader(batch_size, context_length = 1024, seed=1234):
     if os.path.exists("data/eventval.parquet"):
         df = pd.read_parquet("data/eventval.parquet", columns=['time', 'eventval'])
         df = df.sample(10)

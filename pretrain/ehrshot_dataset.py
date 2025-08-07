@@ -4,19 +4,13 @@ import pandas as pd
 
 from sklearn.model_selection import train_test_split
 
-#from hf_ehr.data.tokenization import CLMBRTokenizer
-#from hf_ehr.config import Event
+from hf_ehr.data.tokenization import CLMBRTokenizer
+from hf_ehr.config import Event
 
-DATA_DIR = 'data'
+DATA_DIR = '/home/mkeoliya/projects/arpa-h/raw_data'
 
 class SickDataset(Dataset):
     def __init__(self, data):
-        """
-        Args:
-            ecg_data: numpy array of shape (total_samples, n_leads)
-            labels: numpy array with timestamps of abnormal events
-            window_size: number of samples in each snippet
-        """
         self.samples = data[['eventval', 'time']]
         self.index_map = list(range(len(self.samples)))
         random.shuffle(self.index_map)
@@ -70,7 +64,7 @@ def read_df(context_length):
             df_final = pd.concat([df_final, df])
     return df_final
 
-def sick_loader(batch_size, context_length=1000, seed=1234):
+def ehrshot_loader(batch_size, context_length=1024, seed=1234):
     df = read_df(context_length)
     
     train_inputs, temp_inputs = train_test_split(

@@ -1,3 +1,4 @@
+from hf_ehr.data.tokenization import CLMBRTokenizer
 from transformers import PreTrainedTokenizerFast
 
 import torch
@@ -12,7 +13,8 @@ from tqdm import tqdm
 import wandb
 from argparse import ArgumentParser
 
-from dataset import sepsis_loader
+from ehrshot_dataset import ehrhsot_loader
+from mcmed_dataset import mcmed_loader
 from models import CustomGPT, CustomMamba
 
 EPS = 1e-2
@@ -30,7 +32,8 @@ class Trainer():
         self.criterion = F.cross_entropy
         self.ignore_seq = 4
 
-        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/decomp_tokenizer.json")
+        self.tokenizer = CLMBRTokenizer.from_pretrained("StanfordShahLab/mamba-tiny-16384-clmbr")
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/eventval_tokenizer.json")
         self.tokenizer.eos_token = '[EOS]'
         self.tokenizer.sep_token = '[SEP]'
         self.tokenizer.bos_token = '[BOS]'
@@ -58,15 +61,15 @@ class Trainer():
         num_items = 0
         iter = tqdm(self.train_loader, total=len(self.train_loader))
         self.network.train()
-        for (i, (events, times, _)) in enumerate(iter):
+        for i, (events, times) in enumerate(iter):
             self.optimizer.zero_grad()
 
             input_ids, times, attention_mask = self.get_inputs(events, times)
-            target = input_ids[:, 1+self.ignore_seq:]
-
+            
             output = self.network(input_ids[:, :-1], times[:, :-1], attention_mask[:, :-1])
             output = output[:, self.ignore_seq:].squeeze(-1)
             
+            target = input_ids[:, 1+self.ignore_seq:]
             loss = self.criterion(output.flatten(0, 1), target.flatten())
             loss.backward()
             self.optimizer.step()
@@ -86,13 +89,14 @@ class Trainer():
         num_items = 0
         iter = tqdm(self.test_loader, total=len(self.test_loader))
         self.network.eval()
-        for (i, (events, times, _)) in enumerate(iter):
+        for i, (events, times) in enumerate(iter):
             with torch.no_grad():
                 input_ids, times, attention_mask = self.get_inputs(events, times)
-                target = input_ids[:, 1+self.ignore_seq:]
 
                 output = self.network(input_ids[:, :-1], times[:, :-1], attention_mask[:, :-1])
                 output = output[:, self.ignore_seq:].squeeze(-1)
+
+                target = input_ids[:, 1+self.ignore_seq:]
 
                 total_correct += (output.argmax(dim=-1) == target).float().sum()
                 num_items += target.numel()
@@ -117,17 +121,18 @@ class Trainer():
         
             if self.save_model and test_acc > self.best_acc:
                 self.best_acc = test_acc
-                torch.save(self.network.state_dict(), "checkpoints/decomp_eventval_mamba.pth")
+                torch.save(self.network.state_dict(), f"checkpoints/{args.task}-{args.model}.pth")
 
 
 if __name__ == "__main__":
     # Argument parser
     parser = ArgumentParser("sepsis")
     parser.add_argument("--n-epochs", type=int, default=100)
-    parser.add_argument("--gpu", type=int, default=9)
+    parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--model", type=str, choices=["gpt", "mamba"], default="mamba")
+    parser.add_argument("--model", type=str, choices=["gpt", "mamba"], default="gpt")
+    parser.add_argument("--task", type=str, choices=["ehrshot", "mcmed", "mimic"], default="ehrshot")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--cuda", action="store_true")
     args = parser.parse_args()
@@ -142,14 +147,17 @@ if __name__ == "__main__":
         model = CustomMamba
 
     # Load data
-    (train_loader, val_loader, test_loader) = sepsis_loader(args.batch_size, seed=args.seed)
+    if args.task == "ehrshot":
+        (train_loader, val_loader, test_loader) = ehrshot_loader(args.batch_size, seed=args.seed)
+    elif args.task == "mcmed":
+        (train_loader, val_loader, test_loader) = mcmed_loader(args.batch_size, seed=args.seed)
     print("LOADED")
     trainer = Trainer(model, train_loader, test_loader, val_loader, args.learning_rate, args.gpu)
 
     # setup wandb
     config = vars(args)
     run = wandb.init(
-        project=f"MCMED_decomp_pretrain",
+        project=f"pretrain-{args.task}-{args.model}",
         config=config)
     print(config)
 
