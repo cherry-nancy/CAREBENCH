@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 
 from models import CustomGPT, CustomMamba
+from models_nesy import CustomGPT as CustomGPTLinear
 
 tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/eventval_tokenizer.json")
 tokenizer.eos_token = '[EOS]'
@@ -15,6 +16,35 @@ tokenizer.bos_token = '[BOS]'
 tokenizer.pad_token = '[PAD]'
 tokenizer.cls_token = '[CLS]'
 tokenizer.mask_token = '[MASK]'
+
+def inference(inputs, demos, times, temperature=1.0):
+    next_probabilities = []
+
+    for i in range(4):
+        max_len = max(len(i) for i in inputs)
+        demo_inputs = [demo + inputs_i for demo, inputs_i in zip(demos, inputs)]
+        tokens = tokenizer(demo_inputs, return_tensors="pt", is_split_into_words=True, padding=True, return_attention_mask=True)
+        sequences = tokens["input_ids"].to(device)   
+        attention_masks = tokens["attention_mask"].to(device) 
+
+        seq_times = [F.pad(torch.tensor(r, dtype=torch.float32), (4, max_len - len(r))).round(decimals=2)  for r in times]
+        seq_times = torch.stack(seq_times, dim=0).to(device) 
+
+        next_ids = model(sequences, seq_times, attention_masks)
+        
+        next_token_logits = next_ids[:, -1, :] / temperature
+        if temperature > 0:
+            next_token_logits = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(next_token_logits, num_samples=1)
+        else:
+            # Greedy decoding
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        
+        inputs = [inputs_i[-1019:] + [next_i] for (inputs_i, next_i) in zip(inputs, tokenizer.convert_ids_to_tokens(next_token))]
+        times = [t_i[-1019:] + [t_i[-1] + 0.25] for t_i in times]
+        next_probabilities.append(F.softmax(next_ids[:, -1, :], dim=-1))
+    next_probabilities = torch.stack(next_probabilities, dim=1)
+    return next_probabilities
 
 def create_df_limit(label_df, ids, stay=True):
     df = None
@@ -41,7 +71,7 @@ def create_df_limit(label_df, ids, stay=True):
         else: df = pd.concat([df, df_i])
     return df
 
-def mortality_loader():
+def mortality_loader(i):
     label_df = pd.read_csv("data/mortality/mortality_labels.csv", usecols=['subject_id', 'stay_id', 'Label', 'intime', 'Time'])
     
     demo_df = pd.read_parquet('data/mortality/demographics.parquet', columns=['race_str', 'gender_str', 'ethnicity_str', 'age_str'])
@@ -50,7 +80,7 @@ def mortality_loader():
     demo_df = demo_df.drop(columns=['gender_str', 'race_str', 'age_str', 'ethnicity_str'])
     
     test_ids = pd.read_csv('mortality.csv')
-    test_ids = test_ids[:10]
+    test_ids = test_ids[i*1 : (i+1)*1]
     label_df = label_df[label_df['subject_id'].isin(test_ids['subject_id'])]
     demo_df = demo_df[demo_df['subject_id'].isin(test_ids['subject_id'])]
 
@@ -76,21 +106,26 @@ def get_inputs(inputs, times):
 
 
 if __name__ == "__main__":
-    model_name = 'gpt'
+    model_name = 'other'
     device =torch.device("cuda:%d" % 0) if torch.cuda.is_available() else torch.device('cpu')
 
     if model_name == "gpt":
         model = CustomGPT(vocab_size=len(tokenizer)).to(device)
     elif model_name == "mamba":
         model = CustomMamba(vocab_size=len(tokenizer)).to(device)
-    context_length = 1024
+    else:
+        model = CustomGPTLinear(vocab_size=len(tokenizer)).to(device)
+        classifier = torch.nn.Linear(len(tokenizer), 1).to(device)
+        classifier.load_state_dict(torch.load('checkpoints/mortality_classifier_gpt_1234.pth', map_location=device))
 
-    lmhead_state_dict = torch.load("checkpoints/mortality_gpt_1234.pth", weights_only=True, map_location=device)
+    context_length = 1020
+
+    lmhead_state_dict = torch.load(f"checkpoints/mortality_linear_gpt_1234.pth", weights_only=True, map_location=device)
     model.load_state_dict(state_dict=lmhead_state_dict, strict=True)
 
-    for i in range(20, 6231, 10):
+    for i in range(0, 101, 10):
         # Load data
-        df_all, label_df, demo_df, probs_df = mortality_loader()
+        df_all, label_df, demo_df, probs_df = mortality_loader(i)
 
         df_i = None
         TIMES = np.arange(9.0, 12.0, 0.1)
@@ -105,8 +140,8 @@ if __name__ == "__main__":
             df = df.sort_values(['subject_id', 'time']).groupby('subject_id').agg(list).reset_index()
 
             df = df[df['eventval'].apply(len) >= 5]
-            df['eventval'] = df['eventval'].apply(lambda x: x[-(context_length-4):] if len(x) > context_length else x)
-            df['time'] = df['time'].apply(lambda x: x[-(context_length-4):] if len(x) > context_length else x)
+            df['eventval'] = df['eventval'].apply(lambda x: x[-(context_length):] if len(x) > context_length else x)
+            df['time'] = df['time'].apply(lambda x: x[-(context_length):] if len(x) > context_length else x)
 
             df = df.merge(label_df[['subject_id', 'Label']], on='subject_id', how='left')
             df = df.merge(demo_df, on='subject_id', how='left')
@@ -116,8 +151,17 @@ if __name__ == "__main__":
             input_ids = list((df['demo_str'] + df['eventval']).values)
             times = list(df['time'].values) 
 
-            input_ids, times, attention_masks = get_inputs(input_ids, times)
-            output = model(input_ids, times, attention_masks)
+            valid_ids = df['subject_id'].unique()
+            demos = list((df['demo_str']).values)
+            input_ids = list((df['eventval']).values)
+            times = list(df['time'].values) 
+
+            if 'task' == 1:
+                input_ids, times, attention_masks = get_inputs(input_ids, times)
+                output = model(input_ids, times, attention_masks)
+            else:
+                next_probs = inference(input_ids, demos, times)
+                output = classifier(next_probs).squeeze(-1).max(dim=-1).values
             output = torch.sigmoid(output).squeeze(-1)
 
             if df_i is None:
@@ -132,4 +176,4 @@ if __name__ == "__main__":
                 })
                 df_i = df_i.merge(df_temp, on='ids', how='outer')
             
-        df_i.to_csv(f'mortality_stability/mortality_prob_{i}.csv', index=False)
+        df_i.to_csv(f'mortality_stability/{model_name}_prob_{i}.csv', index=False)

@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 
 from models import CustomGPT, CustomMamba
-from models_nesy import CustomGPTLinear
+from models_nesy import CustomGPT as CustomGPTLinear
 
 tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/eventval_tokenizer.json")
 tokenizer.eos_token = '[EOS]'
@@ -22,6 +22,35 @@ DATA_DIR = '/project/ClinicalAI/working_data/seewon/hf_ehr/'
 TIME = 1.0
 HYPERKALEMIA = ['LOINC/LG7931-1', 'LOINC/LP386618-5', 'LOINC/LG10990-6', 'LOINC/6298-4', 'LOINC/2823-3']
 
+def inference(inputs, demos, times, temperature=1.0):
+    next_probabilities = []
+
+    for i in range(4):
+        max_len = max(len(i) for i in inputs)
+        demo_inputs = [demo + inputs_i for demo, inputs_i in zip(demos, inputs)]
+        tokens = tokenizer(demo_inputs, return_tensors="pt", is_split_into_words=True, padding=True, return_attention_mask=True)
+        sequences = tokens["input_ids"].to(device)   
+        attention_masks = tokens["attention_mask"].to(device) 
+
+        seq_times = [F.pad(torch.tensor(r, dtype=torch.float32), (4, max_len - len(r))).round(decimals=2)  for r in times]
+        seq_times = torch.stack(seq_times, dim=0).to(device) 
+
+        next_ids = model(sequences, seq_times, attention_masks)
+        
+        next_token_logits = next_ids[:, -1, :] / temperature
+        if temperature > 0:
+            next_token_logits = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(next_token_logits, num_samples=1)
+        else:
+            # Greedy decoding
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        
+        inputs = [inputs_i[-1019:] + [next_i] for (inputs_i, next_i) in zip(inputs, tokenizer.convert_ids_to_tokens(next_token))]
+        times = [t_i[-1019:] + [t_i[-1] + 0.25] for t_i in times]
+        next_probabilities.append(F.softmax(next_ids[:, -1, :], dim=-1))
+    next_probabilities = torch.stack(next_probabilities, dim=1)
+    return next_probabilities
+
 
 def hk_loader(i):
     label_df = pd.read_parquet(os.path.join(DATA_DIR, "data/lab_hyperkalemia/hyperkalemia_label2.parquet"), columns=['patient_id', 'value', 'start', 'Time'])
@@ -34,7 +63,7 @@ def hk_loader(i):
     df = df[~df['code'].isin(HYPERKALEMIA)]
 
     test_ids = pd.read_csv('hk_1234.csv')
-    test_ids = test_ids[i*10:(i+1)*10]
+    test_ids = test_ids[i*5:(i+1)*5]
     
     label_df = label_df[label_df['patient_id'].isin(test_ids['patient_id'])]
     demo_df = demo_df[demo_df['patient_id'].isin(test_ids['patient_id'])]
@@ -72,13 +101,15 @@ if __name__ == "__main__":
         model = CustomMamba(vocab_size=len(tokenizer)).to(device)
     elif model_name == 'gpt_linear':
         model = CustomGPTLinear(vocab_size=len(tokenizer)).to(device)
+        classifier = torch.nn.Linear(len(tokenizer)*4, 1).to(device)
+        classifier.load_state_dict(torch.load('checkpoints/hk_classifier_gpt_1234.pth', map_location=device))
     
     context_length = 1024
 
     lmhead_state_dict = torch.load(f"checkpoints/hyperkalemia_{model_name}_1234.pth", weights_only=True, map_location=device)
     model.load_state_dict(state_dict=lmhead_state_dict, strict=True)
 
-    for i in range(0, 1185, 10):
+    for i in range(0, 1184, 5):
         # Load data
         df_all, label_df, demo_df, probs_df = hk_loader(i)
 
@@ -104,11 +135,12 @@ if __name__ == "__main__":
             valid_ids = df['patient_id'].unique()
 
             df['demo_str'] = df.apply(lambda sample: [sample['age_str'], sample['gender_str'], sample['race_str'], sample['ethnicity_str']], axis=1)
-            input_ids = list((df['demo_str'] + df['eventval']).values)
+            demos = list(df['demo_str'].values)
+            input_ids = list(df['eventval'].values)
             times = list(df['start'].values) 
 
-            input_ids, times, attention_masks = get_inputs(input_ids, times)
-            output = model(input_ids, times, attention_masks)
+            next_probs = inference(input_ids, demos, times)
+            output = classifier(next_probs.flatten(1)).squeeze(-1)
             output = torch.sigmoid(output).squeeze(-1)
 
             if df_i is None:

@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 
 from models import CustomGPT, CustomMamba
+from models_nesy import CustomGPT as CustomGPTLinear
 
 tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/ed_eventval_tokenizer.json")
 tokenizer.eos_token = '[EOS]'
@@ -17,21 +18,35 @@ tokenizer.pad_token = '[PAD]'
 tokenizer.cls_token = '[CLS]'
 tokenizer.mask_token = '[MASK]'
 
-class TimeSeriesDataset(Dataset):
-    def __init__(self, input_ids_all, times_all):
-        self.input_ids_all = input_ids_all
-        self.times_all = times_all
+def inference(inputs, demos, times, temperature=1.0):
+    next_probabilities = []
 
-    def __len__(self):
-        return len(self.input_ids_all)
+    for i in range(4):
+        max_len = max(len(i) for i in inputs)
+        demo_inputs = [demo + inputs_i for demo, inputs_i in zip(demos, inputs)]
+        tokens = tokenizer(demo_inputs, return_tensors="pt", is_split_into_words=True, padding=True, return_attention_mask=True)
+        sequences = tokens["input_ids"].to(device)   
+        attention_masks = tokens["attention_mask"].to(device) 
 
-    def __getitem__(self, idx):
-        return self.input_ids_all[idx], self.times_all[idx]
+        seq_times = [F.pad(torch.tensor(r, dtype=torch.float32), (3, max_len - len(r))).round(decimals=2)  for r in times]
+        seq_times = torch.stack(seq_times, dim=0).to(device) 
 
-def collate_fn(batch):
-    input_ids, times = zip(*batch)
-    input_ids, times, attention_masks = get_inputs(list(input_ids), list(times))
-    return input_ids, times, attention_masks
+        next_ids = model(sequences, seq_times, attention_masks)
+        
+        next_token_logits = next_ids[:, -1, :] / temperature
+        if temperature > 0:
+            next_token_logits = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(next_token_logits, num_samples=1)
+        else:
+            # Greedy decoding
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        
+        inputs = [inputs_i[-1019:] + [next_i] for (inputs_i, next_i) in zip(inputs, tokenizer.convert_ids_to_tokens(next_token))]
+        times = [t_i[-1019:] + [t_i[-1] + 0.25] for t_i in times]
+        next_probabilities.append(F.softmax(next_ids[:, -1, :], dim=-1))
+    next_probabilities = torch.stack(next_probabilities, dim=1)
+    return next_probabilities
+
 
 def icu_loader(i):
     med_df = pd.read_csv(f"data/transfer/med.csv", usecols=['stay_id', 'charttime', 'eventval'])
@@ -75,7 +90,7 @@ def get_inputs(inputs, times):
 
 
 if __name__ == "__main__":
-    model_name = 'gpt'
+    model_name = 'other'
 
     device =torch.device("cuda:%d" % 0) if torch.cuda.is_available() else torch.device('cpu')
 
@@ -83,9 +98,14 @@ if __name__ == "__main__":
         model = CustomGPT(vocab_size=len(tokenizer)).to(device)
     elif model_name == "mamba":
         model = CustomMamba(vocab_size=len(tokenizer)).to(device)
+    else:
+        model = CustomGPTLinear(vocab_size=len(tokenizer)).to(device)
+        classifier = torch.nn.Linear(len(tokenizer), 1).to(device)
+        classifier.load_state_dict(torch.load('checkpoints/icu_classic_gpt_1234.pth', map_location=device))
+
     context_length = 1024
 
-    lmhead_state_dict = torch.load("checkpoints/icu_gpt_1234.pth", weights_only=True, map_location=device)
+    lmhead_state_dict = torch.load("checkpoints/icu_linear_gpt_3177.pth", weights_only=True, map_location=device)
     model.load_state_dict(state_dict=lmhead_state_dict, strict=True)
 
     for i in range(60, 11810, 10):
@@ -109,12 +129,17 @@ if __name__ == "__main__":
             df = df.merge(demo_df, on='stay_id', how='left')
 
             valid_ids = df['stay_id'].unique()
-            input_ids = list((df['demo_str'] + df['eventval']).values)
+            demos = list((df['demo_str']).values)
+            input_ids = list((df['eventval']).values)
             times = list(df['charttime'].values) 
 
-            input_ids, times, attention_masks = get_inputs(input_ids, times)
+            if 'task' == 1:
+                input_ids, times, attention_masks = get_inputs(input_ids, times)
+                output = model(input_ids, times, attention_masks)
+            else:
+                next_probs = inference(input_ids, demos, times)
+                output = classifier(next_probs).squeeze(-1).max(dim=-1).values
 
-            output = model(input_ids, times, attention_masks)
             output = torch.sigmoid(output).squeeze(-1)
 
             # probs_df[TIME] = (torch.stack(probs_all, dim=-1).flatten()).detach().cpu().numpy()
@@ -132,4 +157,4 @@ if __name__ == "__main__":
                 })
                 df_i = df_i.merge(df_temp, on='ids', how='outer')
             
-        df_i.to_csv(f'transfer_stability/transfer_prob_{i}.csv', index=False)
+        df_i.to_csv(f'transfer_stability/mamba_prob_{i}.csv', index=False)
