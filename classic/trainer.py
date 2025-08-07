@@ -3,22 +3,24 @@ import random
 from argparse import ArgumentParser
 import numpy as np
 import joblib
+import os
 
 from xgboost import XGBClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, confusion_matrix, average_precision_score
 
 import pandas as pd
 from sklearn.impute import SimpleImputer, KNNImputer
 
-from icu_loader import icu_loader
-from mortality_loader import mortality_loader
-from mcmed_loader import sepsis_loader, decomp_loader
-from ehrshot_loader import hyperkalemia_loader, hypolgycemia_loader 
+from ehrshot_dataset import hyperkalemia_loader, hypoglycemia_loader
+from mcmed_dataset import decomp_loader_classic, sepsis_loader_classic
+from mortality_dataset import mortality_loader
+from transfer_dataset import transfer_loader
 
 def impute(X_train, X_test, X_val, method, i):
     features = X_train.columns
+
     if method == 'mean':
         imputer = SimpleImputer(strategy='mean')
     elif method == 'median':
@@ -59,12 +61,12 @@ class XGBTrainer:
 
         for i in range(n_repeats):
             X_train, X_temp, y_train, y_temp, ids_train, ids_temp = train_test_split(
-                self.X, self.y, self.ids, test_size=0.4, random_state=random_state, stratify=self.y
+                self.X, self.y, self.ids, test_size=0.4, random_state=i, stratify=self.y
             )
 
             # Step 2: Split temp into validation (20%) and test (20%) -> each is 50% of the remaining 40%
             X_val, X_test, y_val, y_test, ids_val, ids_test = train_test_split(
-                X_temp, y_temp, ids_temp, test_size=0.5, random_state=random_state, stratify=y_temp
+                X_temp, y_temp, ids_temp, test_size=0.5, random_state=i, stratify=y_temp
             )
             
             X_train, X_test, X_val = impute(X_train, X_test, X_val, method, i)
@@ -142,6 +144,30 @@ class TreeTrainer:
         self.y = y
         self.ids = ids
         self.save_model = save_model
+        
+        pos_count = np.sum(y == 1)
+        neg_count = np.sum(y == 0)
+        weight_ratio = neg_count / pos_count
+        class_weight = {0: 1.0, 1: weight_ratio}
+
+        if model_type == 'rf':
+            self.model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_split=2,
+                class_weight=class_weight,
+                random_state=1234,
+                n_jobs=-1  # Use all available cores
+            )
+        elif model_type == 'et':
+            self.model = ExtraTreesClassifier(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_split=2,
+                class_weight=class_weight,
+                random_state=1234,
+                n_jobs=-1  # Use all available cores
+            )
 
     def cross_validate_model(self, n_splits=2, n_repeats=1, random_state=42):
         metrics = {
@@ -150,33 +176,21 @@ class TreeTrainer:
 
         for i in range(n_repeats):
             X_train, X_temp, y_train, y_temp, ids_train, ids_temp = train_test_split(
-                self.X, self.y, self.ids, test_size=0.4, random_state=random_state, stratify=self.y
+                self.X, self.y, self.ids, test_size=0.4, random_state=i, stratify=self.y
             )
 
+            # Step 2: Split temp into validation (20%) and test (20%) -> each is 50% of the remaining 40%
             X_val, X_test, y_val, y_test, ids_val, ids_test = train_test_split(
-                X_temp, y_temp, ids_temp, test_size=0.5, random_state=random_state, stratify=y_temp
+                X_temp, y_temp, ids_temp, test_size=0.5, random_state=i, stratify=y_temp
             )
 
             X_train, X_test, X_val = impute(X_train, X_test, X_val, method, i)
-
-            pos_count = np.sum(y_train == 1)
-            neg_count = np.sum(y_train == 0)
-            weight_ratio = neg_count / pos_count
-            class_weight = {0: 1.0, 1: weight_ratio}
-
-            model = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=10,
-                min_samples_split=2,
-                class_weight=class_weight,
-                random_state=1234,
-                n_jobs=-1  # Use all available cores
-            )
+            print(ids_test)
             
             # Train
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            y_pred_prob = model.predict_proba(X_test)[:, 1]
+            self.model.fit(X_train, y_train)
+            y_pred = self.model.predict(X_test)
+            y_pred_prob = self.model.predict_proba(X_test)[:, 1]
             
             # Metrics
             acc = accuracy_score(y_test, y_pred)
@@ -197,7 +211,7 @@ class TreeTrainer:
             if self.save_model:
                 ids_test['probs'] = y_pred_prob
                 ids_test.to_csv(f"results/{task}/{model_name}_{task}_{method}_{i}.csv", index=False)
-                joblib.dump(model, f"results/{task}/{model_name}_{task}_{method}_{i}.pkl")
+                joblib.dump(self.model, f"results/{task}/{model_name}_{task}_{method}_{i}.pkl")
             
             wandb.log({
                 'acc': (acc),
@@ -224,49 +238,48 @@ class TreeTrainer:
     
 if __name__ == "__main__":
     # Argument parser
-    parser = ArgumentParser("classic")
-    parser.add_argument("--learning-rate", type=float, default=0.1)  # Used for XGBoost
+    parser = ArgumentParser("decomp_classic")
+    parser.add_argument("--learning-rate", type=float, default=0.1)  # Used for XGBoost and LightGBM
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--save-model", default=True)
-    parser.add_argument("--model", type=str, choices=["xgb", "rf",], default="rf",
-                         help="Model type: xgboost or random forest")
-    parser.add_argument("--impute", type=str, choices=["mean", "median", "knn"], default="median")
-    parser.add_argument("--task", type=str, choices=['sepsis', 'decomp', 'mortality', 'icu', 'hyperkalemia', 'hypoglycemia'], 
-                         default="sepsis")
+    parser.add_argument("--model", type=str, choices=["xgb", "rf",], default="rf")
+    parser.add_argument("--task", type=str, choices=["sepsis", "decomp"], default="sepsis")
     args = parser.parse_args()
     
     # Setup random seed
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    model_name = args.model
     task = args.task
-    method = args.impute
+    model_name = args.model
+    method = 'median'
 
-    if args.task == 'sepsis':
-        X, y, ids = sepsis_loader()
-    elif args.task == 'decomp':
-        X, y, ids = decomp_loader()
-    elif args.task == 'mortality':
-        X, y, ids = mortality_loader()
-    elif args.task == 'icu':
-        X, y, ids = icu_loader()
-    elif args.task == 'hyperkalemia':
+    if not os.path.exists(f'results/{task}'):
+        os.makedirs(f'results/{task}')
+
+    if task == 'hyperkalemia': 
         X, y, ids = hyperkalemia_loader()
-    elif args.task == 'hypoglycemia':
-        X, y, ids = hypolgycemia_loader()
-
+    elif task == 'hypoglycemia':
+       X, y, ids = hypoglycemia_loader()
+    elif task == 'sepsis':
+        X, y, ids = sepsis_loader_classic()
+    elif task == 'decompensation':
+        X, y, ids = decomp_loader_classic()
+    elif task == 'mortality':
+        X, y, ids = mortality_loader()
+    elif task == 'transfer':
+        X, y, ids = transfer_loader()
+        
     # Initialize wandb
     config = vars(args)
-    config['task'] = task
-    config['model'] = model_name
     config['impute'] = method
-    
     run = wandb.init(
-        project=f"Classic",
+        project=f"classic",
+        name=f'{model_name}_{task}_{method}',
         config=config
     )
     print(config)
+    print(y['value'].value_counts())
     
     # Select trainer based on model type
     if model_name == "rf":
@@ -282,7 +295,7 @@ if __name__ == "__main__":
         )
 
     # Train and evaluate
-    trainer.cross_validate_model()
+    trainer.cross_validate_model(n_repeats=5)
     
     # Finish wandb run
     run.finish()

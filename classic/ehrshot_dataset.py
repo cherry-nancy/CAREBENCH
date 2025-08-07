@@ -1,53 +1,53 @@
 import pandas as pd
-
-from dataset import extract_stats
+import numpy as np
+from scipy.stats import linregress, kurtosis, skew
 
 TIME = 1.0
-
-def hypoglycemia_loader():
-    return lab_task_loader('hypoglycemia')
+HYPERKALEMIA = ['LOINC/LG7931-1', 'LOINC/LP386618-5', 'LOINC/LG10990-6', 'LOINC/6298-4', 'LOINC/2823-3']
+HYPOGLYCEMIA = ['SNOMED/33747003', 'LOINC/LP416145-3', 'LOINC/14749-6']
 
 def hyperkalemia_loader():
     return lab_task_loader('hyperkalemia')
 
+def hypoglycemia_loader():
+    return lab_task_loader('hyloglycemia')
+
 def remove_rows(df, label_df, time):
     df = df.merge(label_df[['patient_id', 'Time', 'start_time']], on='patient_id')
-    df['start'] = pd.to_datetime(df['start'])
 
-    # df = df[df['Time'] - df['start_time'] >= time]
-    df = df[df['start'] >= df['start_time']]
-    df = df[df['start'] <= df['Time'] - time]
+    df['start'] = (df['start'] - df['start_time']).dt.total_seconds() / 3600
+    df['Time'] = (df['Time'] - df['start_time']).dt.total_seconds() / 3600
+
+    df = df[df['Time'] >= time]
+    df = df[df['start'] <= (df['Time'] - time)]
     df = df.drop(columns=['start', 'Time', 'start_time'])
     return df
 
-def lab_task_loader(task_type, task_prefix='lab_', multi=False):
+def lab_task_loader(task_type, task_prefix='lab_'):
     data = pd.read_parquet(f"data/{task_prefix}{task_type}/{task_type}2.parquet", columns=['code', 'value', 'patient_id', 'start'])
+    if task_type == 'hyperkalemia':
+        data = data[~data['code'].isin(HYPERKALEMIA)]
+    elif task_type == 'hypoglycemia':
+        data = data[~data['code'].isin(HYPOGLYCEMIA)]
+
     demo = pd.read_parquet(f"data/{task_prefix}{task_type}/{task_type}_demo.parquet", columns=['patient_id', 'age', 'gender_ind', 'race_ind', 'ethnicity_ind'])
     label = pd.read_parquet(f"data/{task_prefix}{task_type}/{task_type}_label2.parquet")
     label['Time'] = label.apply(lambda x: x['prediction_time'] if x['value'] else x['Sample_time'], axis=1)
     label = label.rename(columns={'start': 'start_time'})
 
-    if multi:
-        if 'value_multi' in label.columns:
-            label['value'] = label['value_multi']
-            label = label.drop(columns=['value_multi'])
-    else:
-        if 'value_multi' in label.columns:
-            label = label.drop(columns=['value_multi'])
+    if 'value_multi' in label.columns:
+        label = label.drop(columns=['value_multi'])
     
-    N = pd.Timedelta(hours=TIME)
-    print(N)
-    data = remove_rows(data, label, N)
+    data = remove_rows(data, label, TIME)
     data = run_get_classic(data)
+    data = data.drop_duplicates()
 
     data = data.merge(label[['patient_id', 'value']], on='patient_id')
     data = data.merge(demo, on='patient_id')
 
     X = data.drop(columns=['value', 'patient_id'])
     y = data[['value']]
-    ids = data[['patient_id']]
-    print(data['value'].value_counts())
-    
+    ids = data[['patient_id']]    
     return X, y, ids
 
 
@@ -56,8 +56,8 @@ def run_get_classic(df, start=0, end=30):
     codes.groupby('code')['patient_id'].nunique().sort_values(ascending=False).reset_index()
     codes = codes['code'].unique()
     
+    df_grouped = df[['patient_id']]
     df = df[df['code'].isin(codes)]
-    df_grouped = None
     for c in codes[start:end]:
         print(c)
         df_i = df[df['code'] == c].copy()
@@ -82,3 +82,21 @@ def run_get_classic(df, start=0, end=30):
     df_grouped[count_columns] = df_grouped[count_columns].fillna(0)
 
     return df_grouped
+
+def extract_stats(xs):
+    xs = np.array(xs, dtype=float)
+    x = np.arange(len(xs))
+    slope, _, _, _, _ = linregress(x, xs)
+
+    return pd.Series({
+        'min': xs.min(),
+        'max': xs.max(),
+        'mean': xs.mean(),
+        'std': xs.std(),
+        'median': np.median(xs),
+        'skew': skew(xs),
+        'kurtosis': kurtosis(xs),
+        'slope': slope,
+        'qr_25': np.quantile(xs, 0.25),
+        'qr_75': np.quantile(xs, 0.75),
+    })

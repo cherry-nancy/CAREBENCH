@@ -1,32 +1,29 @@
 import pandas as pd
-from dataset import extract_stats
+import numpy as np
+from scipy.stats import linregress, kurtosis, skew
 
 TIME = 12.0
 
 def remove_rows(label_df, time, stay=True):
     df_final = None
-    for i in range(0, 37):
+    for i in range(0, 11):
         df = pd.read_parquet(f"data/mortality/{i}_final.parquet")
-        df = df.merge(label_df[['subject_id', 'stay_id', 'intime', 'outtime', 'deathtime']], on='subject_id')
+        df = df.merge(label_df[['subject_id', 'stay_id', 'intime', 'Time']], on='subject_id')
         
         if stay:
-            # df = df[(df['stay_id_x'].isna()) | (df['stay_id_x'] == df['stay_id_y'])]
             df = df[(df['stay_id_x'] == df['stay_id_y'])]
 
         df['time'] = pd.to_datetime(df['time'])
-        # df['intime'] = pd.to_datetime(df['intime'])
-        df['outtime'] = pd.to_datetime(df['outtime'])
-        df['deathtime'] = pd.to_datetime(df['deathtime'])
+        df['Time'] = pd.to_datetime(df['Time'])
 
-        df = df[((~df['deathtime'].isna()) & (df['time'] <= (df['deathtime'] - time))) | 
-                ((df['deathtime'].isna()) & (df['time'] <= (df['outtime'] - time)))]
+        df = df[((df['time'] <= (df['Time'] - time)))]
         
-        df = df.drop(columns=['intime', 'outtime', 'deathtime'])
+        df = df.drop(columns=['intime', 'Time'])
         if df_final is None:
             df_final = df
         else:
             df_final = pd.concat([df_final, df], ignore_index=True)
-    return df
+    return df_final
 
 def mortality_loader():
     label = pd.read_csv(f"data/mortality/mortality_labels.csv")
@@ -53,8 +50,8 @@ def run_get_classic(df, start=0, end=30):
     codes = df[['subject_id', 'itemid']].groupby('itemid')['subject_id'].nunique().sort_values(ascending=False).reset_index()
     codes = codes['itemid'].unique()[:30]
     
+    df_grouped = df[['subject_id']]
     df = df[df['itemid'].isin(codes)]
-    df_grouped = None
     for c in codes[start:end]:
         print(c)
         df_i = df[df['itemid'] == c].copy()
@@ -79,3 +76,21 @@ def run_get_classic(df, start=0, end=30):
     df_grouped[count_columns] = df_grouped[count_columns].fillna(0)
 
     return df_grouped
+
+def extract_stats(xs):
+    xs = np.array(xs, dtype=float)
+    x = np.arange(len(xs))
+    slope, _, _, _, _ = linregress(x, xs)
+
+    return pd.Series({
+        'min': xs.min(),
+        'max': xs.max(),
+        'mean': xs.mean(),
+        'std': xs.std(),
+        'median': np.median(xs),
+        'skew': skew(xs),
+        'kurtosis': kurtosis(xs),
+        'slope': slope,
+        'qr_25': np.quantile(xs, 0.25),
+        'qr_75': np.quantile(xs, 0.75),
+    })
