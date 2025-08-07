@@ -3,6 +3,8 @@ from transformers import AutoModelForCausalLM
 
 import torch
 import torch.nn as nn
+from peft import get_peft_model, LoraConfig, TaskType
+
 
 def pool_hidden_states(strategy, hidden_states, attention_mask=None):
     if strategy == "mean":
@@ -39,7 +41,7 @@ def pool_hidden_states(strategy, hidden_states, attention_mask=None):
         raise ValueError(f"Unsupported pooling strategy: {strategy}")
 
 class CustomGPT(nn.Module):
-    def __init__(self, vocab_size=1969, hidden_size=768, output_size=1, full=True, strategy='mean'):
+    def __init__(self, vocab_size=1969, hidden_size=768, output_size=1, full=False, strategy='mean'):
         super().__init__()
         self.vocab_size = vocab_size
         self.model = GPT2Model.from_pretrained("gpt2")
@@ -52,9 +54,8 @@ class CustomGPT(nn.Module):
             for i in range(-2, 0):  # Last two blocks
                 for param in self.model.h[i].parameters():
                     param.requires_grad = True
-        
+
         self.time_layer = nn.Linear(1, hidden_size)
-        self.value_layer = nn.Linear(1, hidden_size)
         self.combine_layer = nn.Linear(hidden_size*2, hidden_size)
 
         self.regression_head = nn.Sequential(
@@ -65,10 +66,9 @@ class CustomGPT(nn.Module):
         )
         self.strategy = strategy
 
-    def forward(self, token_embeddings, times, attention_mask=None):
+    def forward(self, input_id, times, attention_mask=None):
+        token_embeddings = self.model.wte(input_id)
         time_embeddings = self.time_layer(times.unsqueeze(-1))
-        # token_embeddings = self.model.wte(input_ids)
-        # value_embeddings = self.value_layer(values.unsqueeze(-1))
         # embs = token_embeddings + time_embeddings
         embs = self.combine_layer(torch.cat([token_embeddings, time_embeddings], dim=-1))
         
@@ -82,23 +82,24 @@ class CustomGPT(nn.Module):
         output = self.regression_head(logits)
         return output
 
-class CustomGPTCLMBR(nn.Module):
-    def __init__(self, vocab_size=1969, hidden_size=768, output_size=1, full=True, strategy='mean'):
+class CustomGPTLoRa(nn.Module):
+    def __init__(self, vocab_size=1969, hidden_size=768, output_size=1, full=False, strategy='mean'):
         super().__init__()
         self.vocab_size = vocab_size
-        self.model = AutoModelForCausalLM.from_pretrained("StanfordShahLab/gpt-base-4096-clmbr")
+
+        model = GPT2Model.from_pretrained("gpt2")
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=32,
+            target_modules=["c_attn", "c_proj", "mlp.c_fc", "mlp.c_proj"],
+            lora_dropout=0.1,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        self.model = get_peft_model(model, lora_config)
         self.model.resize_token_embeddings(vocab_size)
 
-        if not full:
-            for param in self.model.parameters(): 
-                param.requires_grad = False
-
-            for i in range(-2, 0):  # Last two blocks
-                for param in self.model.base_model.h[i].parameters():
-                    param.requires_grad = True
-        
         self.time_layer = nn.Linear(1, hidden_size)
-        self.value_layer = nn.Linear(1, hidden_size)
         self.combine_layer = nn.Linear(hidden_size*2, hidden_size)
 
         self.regression_head = nn.Sequential(
@@ -109,10 +110,9 @@ class CustomGPTCLMBR(nn.Module):
         )
         self.strategy = strategy
 
-    def forward(self, token_embeddings, times, attention_mask=None):
+    def forward(self, input_id, times, attention_mask=None):
+        token_embeddings = self.model.wte(input_id)
         time_embeddings = self.time_layer(times.unsqueeze(-1))
-        # token_embeddings = self.model.wte(input_ids)
-        # value_embeddings = self.value_layer(values.unsqueeze(-1))
         # embs = token_embeddings + time_embeddings
         embs = self.combine_layer(torch.cat([token_embeddings, time_embeddings], dim=-1))
         
@@ -134,26 +134,25 @@ class CustomMamba(nn.Module):
         output_size = 1,
         strategy = 'mean',
         dropout_prob: float = 0.1,
-        full=True
+        full=False
     ):
         super().__init__()
-        self.backbone = AutoModelForCausalLM.from_pretrained("state-spaces/mamba-130m-hf")
+        
         # self.backbone = AutoModelForCausalLM.from_pretrained("StanfordShahLab/mamba-tiny-16384-clmbr")
+        backbone = AutoModelForCausalLM.from_pretrained("state-spaces/mamba-130m-hf")
+
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=32,
+            target_modules=["in_proj", "x_proj", "dt_proj", "out_proj"],
+            lora_dropout=0.1,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        self.backbone = get_peft_model(backbone, lora_config)
         self.backbone.resize_token_embeddings(vocab_size)
 
-        if not full:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-
-            for param in self.backbone.backbone.norm_f.parameters():
-                param.requires_grad = True
-
-            for i in range(-2, 0):  # Last two blocks
-                for param in  self.backbone.backbone.layers[i].parameters():
-                    param.requires_grad = True
-
         self.time_layer = nn.Linear(1, hidden_size)
-        # self.value_layer = nn.Linear(1, hidden_size)
         self.combine_layer = nn.Linear(hidden_size*2, hidden_size)
 
         # Create classification head
@@ -165,10 +164,9 @@ class CustomMamba(nn.Module):
         )
         self.strategy = strategy
     
-    def forward(self, token_embeddings, times, attention_mask=None):
-        #token_embeddings = self.backbone.backbone.embeddings(input_ids)
+    def forward(self, input_ids, times, attention_mask=None):
+        token_embeddings = self.backbone.backbone.embeddings(input_ids)
         time_embeddings = self.time_layer(times.unsqueeze(-1))
-       # value_embeddings = self.value_layer(values.unsqueeze(-1))
         # embs = token_embeddings + time_embeddings
         embs = self.combine_layer(torch.cat([token_embeddings, time_embeddings], dim=-1))
                 

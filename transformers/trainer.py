@@ -3,6 +3,7 @@ from transformers import PreTrainedTokenizerFast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 from torcheval.metrics import BinaryAUROC, BinaryF1Score, BinaryPrecision, BinaryRecall, BinaryConfusionMatrix, BinaryAUPRC
 
 import random
@@ -13,17 +14,12 @@ from argparse import ArgumentParser
 from collections import OrderedDict
 
 from models import CustomGPT, CustomMamba
-from mcmed_loader import decomp_loader, sepsis_loader
-from ehrshot_loader import hyperkalemia_loader, hypoglycemia_loader
-from mimic_loader import mortality_loader, icu_loader
-
-tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/eventval_tokenizer.json")
-tokenizer.eos_token = '[EOS]'
-tokenizer.sep_token = '[SEP]'
-tokenizer.bos_token = '[BOS]'
-tokenizer.pad_token = '[PAD]'
-tokenizer.cls_token = '[CLS]'
-tokenizer.mask_token = '[MASK]'
+from decomp_dataset import decomp_loader
+from sepsis_dataset import sepsis_loader
+from hg_dataset import hg_loader
+from hk_dataset import hk_loader
+from transfer_dataset import icu_loader
+from mortality_dataset import mortality_loader
 
 class Trainer():
     def __init__(self, model, train_loader, test_loader, val_loader, learning_rate, gpu, save_model=True):
@@ -35,19 +31,22 @@ class Trainer():
         self.val_loader = val_loader
         self.save_model = save_model
         self.best_acc = 0
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(3373/203).to(self.device))
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(35951./5366).to(self.device))
 
         self.network = model(vocab_size = len(tokenizer), full=False).to(self.device)
-        if args.model == 'load':
-            lmhead_state_dict = torch.load("checkpoints/gpt_eventval.pth", map_location=self.device, weights_only=True)
-            
+        if args.model == 'gpt':
+            lmhead_state_dict = torch.load(f"checkpoints/gpt_eventval.pth", map_location=self.device, weights_only=True)
             new_state_dict = OrderedDict()
             for key, value in lmhead_state_dict.items():
                 if ('lm_head' not in key) and ('wte' not in key):
                     new_key = key.replace('model.transformer', 'model')
                     new_state_dict[new_key] = value
-
             self.network.load_state_dict(new_state_dict, strict=False)
+
+        elif args.model == 'mamba':
+            lmhead_state_dict = torch.load("checkpoints/decomp_eventval_mamba.pth", map_location=self.device, weights_only=True)
+            self.network.load_state_dict(lmhead_state_dict, strict=False)
+
         self.optimizer = torch.optim.AdamW(list(filter(lambda p: p.requires_grad, self.network.parameters())), lr=learning_rate)
 
     def get_inputs(self, inputs, times):
@@ -80,6 +79,7 @@ class Trainer():
             train_loss += loss.item()
             avg_loss = train_loss / (i + 1)
             
+            output = F.sigmoid(output)
             total_correct += (output.round()==target).float().sum() 
             num_items += output.shape[0]
             train_acc = (total_correct / num_items)
@@ -158,17 +158,18 @@ class Trainer():
 
             if self.save_model and test_acc > self.best_acc:
                 self.best_acc = test_acc
-                torch.save(self.network.state_dict(), f"checkpoints/hypoglycemia_{args.model}_{args.seed}.pth")
+                torch.save(self.network.state_dict(), f"checkpoints/{args.task}_{args.model}_{args.seed}.pth")
 
 if __name__ == "__main__":
     # Argument parser
-    parser = ArgumentParser("ehrshot")
+    parser = ArgumentParser("dnn")
     parser.add_argument("--n-epochs", type=int, default=100)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--seed", type=int, default=3177)
     parser.add_argument("--model", type=str, choices=["gpt", "mamba"], default="gpt")
+    parser.add_argument("--task", type=str, default="sepsis")
     parser.add_argument("--cuda", action="store_true")
     args = parser.parse_args()
 
@@ -176,31 +177,41 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
+    task = args.task
+
     if args.model == "gpt":
         model = CustomGPT
     elif args.model == "mamba":
         model = CustomMamba
 
     # Load data
-    if args.task == 'sepsis':
-        (train_loader, val_loader, test_loader) = sepsis_loader(1.5, args.batch_size, seed=args.seed)
-    elif args.task == 'decomp':
-        (train_loader, val_loader, test_loader) = decomp_loader(1.5, args.batch_size, seed=args.seed)
-    elif args.task == 'hyperkalemia':
-        (train_loader, val_loader, test_loader) = hyperkalemia_loader(args.batch_size, context_length=1024, seed=args.seed)
-    elif args.task == 'hypoglycemia':
-        (train_loader, val_loader, test_loader) = hypoglycemia_loader(args.batch_size, context_length=1024, seed=args.seed)
-    elif args.task == 'icu':
-        (train_loader, val_loader, test_loader) = icu_loader(6.0, args.batch_size, context_length=1024, seed=args.seed)
-    elif args.task == 'mortality':
-        (train_loader, val_loader, test_loader) = mortality_loader(12.0, args.batch_size, context_length=1024, seed=args.seed)
+    if task == 'hyperkalemia': 
+        (train_loader, val_loader, test_loader) = hk_loader(args.batch_size)
+    elif task == 'hypoglycemia':
+        (train_loader, val_loader, test_loader) = hg_loader(args.batch_size)
+    elif task == 'sepsis':
+        (train_loader, val_loader, test_loader) = sepsis_loader(args.batch_size)
+    elif task == 'decompensation':
+        (train_loader, val_loader, test_loader) = decomp_loader(args.batch_size)
+    elif task == 'mortality':
+        (train_loader, val_loader, test_loader) = mortality_loader(args.batch_size)
+    elif task == 'transfer':
+        (train_loader, val_loader, test_loader) = icu_loader(args.batch_size)
 
     trainer = Trainer(model, train_loader, test_loader, val_loader, args.learning_rate, args.gpu)
+    
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=f"data/{args.tokenizer}_tokenizer.json")
+    tokenizer.eos_token = '[EOS]'
+    tokenizer.sep_token = '[SEP]'
+    tokenizer.bos_token = '[BOS]'
+    tokenizer.pad_token = '[PAD]'
+    tokenizer.cls_token = '[CLS]'
+    tokenizer.mask_token = '[MASK]'
 
     # setup wandb
     config = vars(args)
     run = wandb.init(
-        project=f"transformer-binary",
+        project=f"DNN_{args.model}",
         config=config)
     print(config)
 

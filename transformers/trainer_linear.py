@@ -3,6 +3,7 @@ from transformers import PreTrainedTokenizerFast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 from torcheval.metrics import BinaryAUROC, BinaryF1Score, BinaryPrecision, BinaryRecall, BinaryConfusionMatrix, BinaryAUPRC
 
 import random
@@ -12,10 +13,13 @@ import wandb
 from argparse import ArgumentParser
 from collections import OrderedDict
 
-from models_linear import CustomGPT, CustomMamba
-from mcmed_loader import decomp_loader, sepsis_loader
-from ehrshot_loader import hyperkalemia_loader, hypoglycemia_loader
-from mimic_loader import mortality_loader, icu_loader
+from models_nesy import CustomGPT
+from decomp_dataset import decomp_loader
+from sepsis_dataset import sepsis_loader
+from hg_dataset import hg_loader
+from hk_dataset import hk_loader
+from transfer_dataset import icu_loader
+from mortality_dataset import mortality_loader
 
 class Trainer():
     def __init__(self, model, train_loader, test_loader, val_loader, learning_rate, gpu, save_model=True):
@@ -27,9 +31,10 @@ class Trainer():
         self.val_loader = val_loader
         self.save_model = save_model
         self.best_acc = 0
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(3323./196).to(self.device))
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(35951./5366).to(self.device))
+        self.N = 3
 
-        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/eventval_tokenizer.json")
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=f"data/{args.tokenizer}_tokenizer.json")
         self.tokenizer.eos_token = '[EOS]'
         self.tokenizer.sep_token = '[SEP]'
         self.tokenizer.bos_token = '[BOS]'
@@ -37,12 +42,8 @@ class Trainer():
         self.tokenizer.cls_token = '[CLS]'
         self.tokenizer.mask_token = '[MASK]'
 
-        self.N = 12
-        self.delta = 1.0
-        self.context_length = 1024
-
         self.network = model(vocab_size = len(self.tokenizer), full=False).to(self.device)
-        if args.model == 'load':
+        if args.model == 'gpt':
             lmhead_state_dict = torch.load(f"checkpoints/gpt_eventval.pth", map_location=self.device, weights_only=True)
             new_state_dict = OrderedDict()
             for key, value in lmhead_state_dict.items():
@@ -50,7 +51,8 @@ class Trainer():
                     new_key = key.replace('model.transformer', 'model')
                     new_state_dict[new_key] = value
             self.network.load_state_dict(new_state_dict, strict=False)
-
+        elif args.model == 'mamba':
+            self.network.load_state_dict(torch.load(f"checkpoints/decomp_eventval_mamba.pth", weights_only=True, map_location=self.device))
         self.classifier = nn.Linear(len(self.tokenizer), 1).to(self.device)
 
         params = list(filter(lambda p: p.requires_grad, self.network.parameters())) + list(self.classifier.parameters())
@@ -68,6 +70,7 @@ class Trainer():
             target = target.to(self.device)
 
             next_probs = self.demo_inference(events, demos, times)
+            # output = self.classifier(next_probs.flatten(1)).squeeze(-1)
             output = self.classifier(next_probs).squeeze(-1).max(dim=-1).values
 
             loss = self.criterion(output, target)
@@ -91,22 +94,21 @@ class Trainer():
         self.network.eval()
         
         auroc = BinaryAUROC().to(self.device)
+        auprc = BinaryAUPRC().to(self.device)
         f1 = BinaryF1Score().to(self.device)
         precision = BinaryPrecision().to(self.device)
         recall = BinaryRecall().to(self.device)
         confusion_matrix = BinaryConfusionMatrix().to(self.device)
-        auprc = BinaryAUPRC().to(self.device)
         
         for (i, (events, demos, times, target)) in enumerate(iter):
             with torch.no_grad():
                 target = target.to(self.device)
 
                 next_tokens = self.demo_inference(events, demos, times)
+                # output = self.classifier(next_tokens.flatten(1)).squeeze(-1)
                 output = self.classifier(next_tokens).squeeze(-1).max(dim=-1).values
-
                 output = F.sigmoid(output)
                 preds = output.round()
-
                 total_correct += (preds==target).float().sum() 
                 num_items += output.shape[0]
                 test_acc = (total_correct / num_items)
@@ -133,34 +135,6 @@ class Trainer():
 
         return test_acc, auc, f1, precision, recall, auprc
 
-    def inference(self, inputs, demos, times, temperature=1.0):
-        next_probabilities = []
-
-        for i in range(self.N):
-            max_len = max(len(i) for i in inputs)
-            tokens = self.tokenizer(inputs, return_tensors="pt", is_split_into_words=True, padding=True, return_attention_mask=True)
-            sequences = tokens["input_ids"].to(self.device)   
-            attention_masks = tokens["attention_mask"].to(self.device) 
-
-            seq_times = [F.pad(torch.tensor(r, dtype=torch.float32), (0, max_len - len(r))).round(decimals=2)  for r in times]
-            seq_times = torch.stack(seq_times, dim=0).to(self.device) 
-
-            next_ids = self.network(sequences, seq_times, attention_masks)
-            
-            next_token_logits = next_ids[:, -1, :] / temperature
-            if temperature > 0:
-                next_token_logits = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(next_token_logits, num_samples=1)
-            else:
-                # Greedy decoding
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-            
-            inputs = [inputs_i[-(self.context_length-1):] + [next_i] for (inputs_i, next_i) in zip(inputs, self.tokenizer.convert_ids_to_tokens(next_token))]
-            times = [t_i[-(self.context_length-1):] + [t_i[-1] + self.delta] for t_i in times]
-            next_probabilities.append(F.softmax(next_ids[:, -1, :], dim=-1))
-        next_probabilities = torch.stack(next_probabilities, dim=1)
-        return next_probabilities
-
     def demo_inference(self, inputs, demos, times, temperature=1.0):
         next_probabilities = []
 
@@ -185,8 +159,8 @@ class Trainer():
                 # Greedy decoding
                 next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
             
-            inputs = [inputs_i[-(self.context_length - 1 - len(d_i)):] + [next_i] for (inputs_i, d_i, next_i) in zip(inputs, demos, self.tokenizer.convert_ids_to_tokens(next_token))]
-            times = [t_i[-(self.context_length - 1 - len(d_i)):] + [t_i[-1] + self.delta] for t_i, d_i in zip(times, demos)]
+            inputs = [inputs_i[-1019:] + [next_i] for (inputs_i, next_i) in zip(inputs, self.tokenizer.convert_ids_to_tokens(next_token))]
+            times = [t_i[-1019:] + [t_i[-1] + 0.5] for t_i in times]
             next_probabilities.append(next_ids[:, -1, :])
         next_probabilities = torch.stack(next_probabilities, dim=1)
         return next_probabilities
@@ -213,7 +187,8 @@ class Trainer():
 
             if self.save_model and test_acc > self.best_acc:
                 self.best_acc = test_acc
-                torch.save(self.network.state_dict(), f"checkpoints/mortality_linear_{args.model}_{args.seed}.pth")
+                torch.save(self.network.state_dict(), f"checkpoints/icu_{args.model}_{args.seed}.pth")
+                torch.save(self.classifier.state_dict(), f"checkpoints/icu_classifier_{args.model}_{args.seed}.pth")
 
 if __name__ == "__main__":
     # Argument parser
@@ -223,8 +198,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--model", type=str, choices=["gpt", "mamba"], default="gpt")
-    parser.add_argument("--task", type=str, choices=['sepsis', 'decomp', 'hyperkalemia', 'hypoglycemia', 'icu', 'mortality'], default='sepsis')    
+    parser.add_argument("--model", type=str, choices=["gpt"], default="gpt")
     parser.add_argument("--cuda", action="store_true")
     args = parser.parse_args()
 
@@ -234,29 +208,27 @@ if __name__ == "__main__":
 
     if args.model == "gpt":
         model = CustomGPT
-    elif args.model == "mamba":
-        model = CustomMamba
 
     # Load data
-    if args.task == 'sepsis':
-        (train_loader, val_loader, test_loader) = sepsis_loader(1.5, args.batch_size, seed=args.seed)
-    elif args.task == 'decomp':
-        (train_loader, val_loader, test_loader) = decomp_loader(1.5, args.batch_size, seed=args.seed)
-    elif args.task == 'hyperkalemia':
-        (train_loader, val_loader, test_loader) = hyperkalemia_loader(args.batch_size, context_length=1024, seed=args.seed)
+    if args.task == 'hyperkalemia': 
+        (train_loader, val_loader, test_loader) = hk_loader(args.batch_size)
     elif args.task == 'hypoglycemia':
-        (train_loader, val_loader, test_loader) = hypoglycemia_loader(args.batch_size, context_length=1024, seed=args.seed)
-    elif args.task == 'icu':
-        (train_loader, val_loader, test_loader) = icu_loader(6.0, args.batch_size, context_length=1024, seed=args.seed)
+        (train_loader, val_loader, test_loader) = hg_loader(args.batch_size)
+    elif args.task == 'sepsis':
+        (train_loader, val_loader, test_loader) = sepsis_loader(args.batch_size)
+    elif args.task == 'decompensation':
+        (train_loader, val_loader, test_loader) = decomp_loader(args.batch_size)
     elif args.task == 'mortality':
-        (train_loader, val_loader, test_loader) = mortality_loader(12.0, args.batch_size, context_length=1024, seed=args.seed)
-        
+        (train_loader, val_loader, test_loader) = mortality_loader(args.batch_size)
+    elif args.task == 'transfer':
+        (train_loader, val_loader, test_loader) = icu_loader(args.batch_size)
+
     trainer = Trainer(model, train_loader, test_loader, val_loader, args.learning_rate, args.gpu)
 
     # setup wandb
     config = vars(args)
     run = wandb.init(
-        project=f"transformer_linear",
+        project=f"LINEAR",
         name=f'{args.task}_{args.model}_{args.seed}',
         config=config)
     print(config)

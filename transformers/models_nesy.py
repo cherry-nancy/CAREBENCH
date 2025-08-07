@@ -1,7 +1,7 @@
 from transformers import GPT2LMHeadModel
 from transformers import AutoModelForCausalLM
 import torch.nn as nn
-
+from peft import get_peft_model, LoraConfig, TaskType
 
 class CustomGPT(nn.Module):
     def __init__(self, vocab_size=1969, hidden_size=768, full=True):
@@ -27,6 +27,43 @@ class CustomGPT(nn.Module):
 
         assert(self.model.base_model.wte.num_embeddings == self.vocab_size)
         token_embeddings = self.model.base_model.wte(input_ids)
+        time_embeddings = self.time_layer(times.unsqueeze(-1))
+        embs = token_embeddings + time_embeddings
+        
+        output = self.model(
+            inputs_embeds = embs,
+            attention_mask=attention_mask,
+            return_dict=True)
+
+        logits = output.logits # [batch_size, seq_len, vocab_size]
+        return logits
+
+
+class CustomGPTLoRa(nn.Module):
+    def __init__(self, vocab_size=1969, hidden_size=768, full=True):
+        super().__init__()
+        self.vocab_size = vocab_size
+        model = GPT2LMHeadModel.from_pretrained("gpt2")
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=32,
+            target_modules=["c_attn", "c_proj", "mlp.c_fc", "mlp.c_proj"],
+            lora_dropout=0.1,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        self.model = get_peft_model(model, lora_config)
+        self.model.resize_token_embeddings(vocab_size)
+        
+        self.time_layer = nn.Linear(1, hidden_size)
+        self.combine_layer = nn.Linear(hidden_size*2, hidden_size)
+
+    def forward(self, input_ids, times, attention_mask=None):
+        assert(input_ids.max().item() < self.vocab_size)  
+        assert(input_ids.min() >= 0)
+
+        assert(self.model.transformer.wte.num_embeddings == self.vocab_size)
+        token_embeddings = self.model.transformer.wte(input_ids)
         time_embeddings = self.time_layer(times.unsqueeze(-1))
         embs = token_embeddings + time_embeddings
         
