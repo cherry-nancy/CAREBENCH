@@ -13,6 +13,7 @@ Produced by 01_prepare_data.ipynb, consumed by the model notebooks:
 import os
 import json
 import random
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +62,11 @@ def load_tokenizer(path=None):
     tokenizer.cls_token = '[CLS]'
     tokenizer.mask_token = '[MASK]'
     return tokenizer
+
+
+def tokenizer_fingerprint(path=None):
+    """Identifies the vocabulary a checkpoint was trained with (01 rebuilds it for every cohort / sample)."""
+    return hashlib.sha256(Path(path or DATA_DIR / 'tokenizer.json').read_bytes()).hexdigest()[:16]
 
 
 # ----------------------------------------------------------------------------- data
@@ -268,10 +274,16 @@ def train_binary_classifier(
         history.append({'epoch': epoch, 'train_loss': running_loss / len(loaders['train']), **{f'val_{k}': v for k, v in val_metrics.items() if k != 'confusion_matrix'}})
         print(f'[epoch {epoch}] train_loss={history[-1]["train_loss"]:.4f} | val {format_metrics(val_metrics)}')
 
-        if val_metrics['auroc'] > best_auroc:
-            best_auroc, bad_epochs = val_metrics['auroc'], 0
+        auroc_undefined = np.isnan(val_metrics['auroc'])
+        if auroc_undefined:
+            print('  WARNING: validation AUROC is undefined (only one class in the validation split); '
+                  'keeping the latest epoch. Use a larger sample for meaningful model selection.')
+        if auroc_undefined or val_metrics['auroc'] > best_auroc:
+            if not auroc_undefined:
+                best_auroc = val_metrics['auroc']
+            bad_epochs = 0
             torch.save(model.state_dict(), ckpt_path)
-            print(f'  saved best checkpoint -> {ckpt_path}')
+            print(f'  saved checkpoint -> {ckpt_path}')
         else:
             bad_epochs += 1
             if bad_epochs >= patience:
