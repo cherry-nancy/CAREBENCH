@@ -189,11 +189,24 @@ def format_metrics(m):
 
 # ----------------------------------------------------------------------------- training
 
+def amp_dtype(device):
+    """bf16 on Ampere+ GPUs (A100, L4, ...), fp16 on older ones (T4, V100), None on CPU.
+    torch.cuda.is_bf16_supported() is not used: it also reports True for the slow emulated bf16 on a T4."""
+    if device.type != 'cuda':
+        return None
+    return torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+
+
 def autocast_context(device, enabled=True):
-    if enabled and device.type == 'cuda':
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        return torch.autocast('cuda', dtype=dtype)
-    return torch.autocast(device.type, enabled=False)
+    dtype = amp_dtype(device) if enabled else None
+    if dtype is None:
+        return torch.autocast(device.type, enabled=False)
+    return torch.autocast('cuda', dtype=dtype)
+
+
+def make_grad_scaler(device, enabled=True):
+    """Loss scaling is only needed for fp16; a disabled scaler is a no-op."""
+    return torch.amp.GradScaler('cuda', enabled=enabled and amp_dtype(device) == torch.float16)
 
 
 @torch.no_grad()
@@ -227,7 +240,8 @@ def train_binary_classifier(
     if pos_weight is None:
         pos_weight = pos_weight_from_loader(loaders['train'])
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
-    print(f'pos_weight={pos_weight:.2f}')
+    scaler = make_grad_scaler(device, use_amp)
+    print(f'pos_weight={pos_weight:.2f} | mixed precision: {amp_dtype(device) if use_amp else None}')
 
     history, best_auroc, bad_epochs = [], -1.0, 0
     for epoch in range(1, n_epochs + 1):
@@ -239,10 +253,12 @@ def train_binary_classifier(
             with autocast_context(device, use_amp):
                 logits = predict_fn(model, batch, train=True)
             loss = criterion(logits.float(), batch['label'].to(device))
-            (loss / grad_accum).backward()
+            scaler.scale(loss / grad_accum).backward()
             if (step + 1) % grad_accum == 0 or step == len(loaders['train']) - 1:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
             running_loss += loss.item()
             progress.set_postfix(loss=f'{running_loss / (step + 1):.4f}')

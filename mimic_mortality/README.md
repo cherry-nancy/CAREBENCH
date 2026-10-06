@@ -31,6 +31,33 @@ Optional overrides: `MORTALITY_DATA_DIR`, `MORTALITY_CHECKPOINT_DIR`, `MORTALITY
 
 MIMIC data must not be sent to hosted LLM APIs ([PhysioNet policy](https://physionet.org/news/post/gpt-responsible-use)).
 
+## Google Colab
+
+The notebooks use the GPU automatically. Mixed precision is bf16 on A100/L4 and fp16 with loss scaling on T4.
+Paste this as the **first cell** of a notebook, before `mortality_common` is imported:
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+!git clone -q https://github.com/cherry-nancy/CAREBENCH.git /content/CAREBENCH
+%cd /content/CAREBENCH/mimic_mortality
+
+import os
+os.environ['MIMIC_DIR'] = '/content/drive/MyDrive/mimiciv/3.1'                       # only needed by 01
+os.environ['MORTALITY_DATA_DIR'] = '/content/drive/MyDrive/mimic_mortality'          # output of 01
+os.environ['MORTALITY_CHECKPOINT_DIR'] = '/content/drive/MyDrive/mimic_mortality/checkpoints'
+os.environ['MORTALITY_RESULTS_DIR'] = '/content/drive/MyDrive/mimic_mortality/results'
+# Mamba: !pip install -q mamba-ssm causal-conv1d      Qwen with vLLM: !pip install -q vllm  (then restart the runtime)
+```
+
+* Run `01_prepare_data.ipynb` on your own machine, which has more RAM than a standard Colab runtime. Then upload
+  `tokenizer.json`, `cohort.csv`, `{train,val,test}.parquet` and `llm_test.parquet` to the Drive folder. `events_raw/` and `sequences/` aren't needed.
+* Keep checkpoints on Drive because Colab runtimes disconnect. GPT2-AR reuses its stage-1 checkpoint if it exists.
+* GPU guide: GPT2 / GPT2-AR fit a T4 at batch size 8. Mamba needs the CUDA kernels above. For Qwen, Qwen3-4B fits a
+  T4/L4, Qwen3-14B needs an A100 40GB, and Qwen3-32B needs 80 GB.
+* Executed notebooks contain patient-level MIMIC text in their outputs (the example timeline in 01, the prompt in 04).
+  Clear the outputs before committing them to GitHub or sharing them.
+
 ## Differences from the original scripts
 
 * Model selection uses validation AUROC. The original saved the best *test* epoch.
